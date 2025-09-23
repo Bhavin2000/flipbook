@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>PDF Flip-Book (StPageFlip edition)</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+
+    <!--  StPageFlip  -->
+    <link href="https://cdn.jsdelivr.net/npm/page-flip@2.0.7/src/Style/stPageFlip.min.css" rel="stylesheet">
+    <style>
+        body {
+            margin: 0;
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center
+        }
+
+        button {
+            padding: 4px 12px;
+            font-size: 16px;
+            cursor: pointer
+        }
+
+        .toolbar,
+        .zoombar {
+            margin: 10px 0;
+            display: flex;
+            gap: 12px;
+            align-items: center
+        }
+
+        /* stage = pan/zoom viewport */
+        .stage {
+            width: 90vw;
+            height: 80vh;
+            position: relative;
+            overflow: hidden;
+            margin-top: 10px;
+            cursor: grab
+        }
+
+        .stage:active {
+            cursor: grabbing
+        }
+
+        /* StPageFlip will inject its own layers inside #book */
+        #book {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform-origin: 0 0;
+            display: flex
+        }
+
+        canvas {
+            background: #fff;
+            border: 1px solid #ccc;
+            height: auto
+        }
+
+        /* just for pdfjs bitmaps */
+    </style>
+</head>
+
+<body>
+    <div class="toolbar">
+        <button id="prev">Prev</button>
+        <span id="pageLabel">1-2/0</span>
+        <button id="next">Next</button>
+    </div>
+
+    <div class="zoombar">
+        <button id="zoomOut">−</button>
+        <input id="zoomRange" type="range" min="1" max="3" step="0.1" value="1">
+        <button id="zoomIn">+</button>
+    </div>
+
+    <div class="stage" id="stage">
+        <div id="book"></div> <!-- StPageFlip root -->
+    </div>
+
+    <!-- pdf.js (v3.10.111)-->
+    <script src="./pdf.min.js"></script>
+
+    <!-- StPageFlip -->
+    <script src="https://cdn.jsdelivr.net/npm/page-flip@2.0.7/dist/js/page-flip.browser.min.js"></script>
+
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "./pdf.worker.min.js";
+
+        window.addEventListener('DOMContentLoaded', async () => {
+
+            /* ---------- DOM ---------- */
+            const stage = document.getElementById('stage');
+            const bookEl = document.getElementById('book');
+            const prevBtn = document.getElementById('prev');
+            const nextBtn = document.getElementById('next');
+            const label = document.getElementById('pageLabel');
+            const zoomOut = document.getElementById('zoomOut');
+            const zoomIn = document.getElementById('zoomIn');
+            const zoomRange = document.getElementById('zoomRange');
+
+            /* ---------- STATE ---------- */
+            const DPR = window.devicePixelRatio || 1;
+            let pdf, totalPages;
+            let SCALE = 1;          // logical zoom     (1‒3)
+            let RENDER = 1;          // bitmap multiplier(SCALE × DPR)
+            let PAGE_RATIO = 1;      // height / width
+            let current = 0;         // StPageFlip uses 0-based left page
+            let isPanning = false, panStart = null;
+
+            /* ---------- helpers ---------- */
+            function updateZoomButtons() {
+                zoomOut.disabled = SCALE <= 1;
+                zoomIn.disabled = SCALE >= 3;
+            }
+
+            /* centre book inside stage */
+            function centreBook() {
+                const sw = stage.clientWidth, sh = stage.clientHeight;
+                const bw = bookEl.offsetWidth, bh = bookEl.offsetHeight;
+                let left = (sw - bw) / 2, top = (sh - bh) / 2;
+                if (SCALE === 1) { left = Math.max(0, left); top = Math.max(0, top); }
+                bookEl.style.left = left + 'px';
+                bookEl.style.top = top + 'px';
+            }
+
+            /* apply CSS transform for zoom (origin = pointer inside stage) */
+            function applyZoom(scale, { x, y }) {
+                const dx = x * (1 - scale), dy = y * (1 - scale);
+                bookEl.style.transform = `translate(${dx}px,${dy}px) scale(${scale})`;
+            }
+
+            /* main zoom driver */
+            function zoomTo(scale, origin) {
+                SCALE = scale; RENDER = scale * DPR; zoomRange.value = scale;
+                applyZoom(scale, origin);
+                centreBook();
+            }
+
+            /* reset zoom to 1× before every page turn */
+            function resetZoom() {
+                SCALE = 1; RENDER = DPR;
+                bookEl.style.transform = 'scale(1)';
+                centreBook();
+            }
+
+            /* ---------- load PDF & create pages ---------- */
+            pdf = await pdfjsLib.getDocument(
+                'https://cdnc.heyzine.com/flip-book/pdf/3a9a96afd17aed2cfbf14a179c6c7e3084385fd9-3.pdf'
+            ).promise;
+            totalPages = pdf.numPages;
+
+            /* build DOM pages (<div.page><canvas></canvas></div>) */
+            for (let n = 1; n <= totalPages; n++) {
+                const page = await pdf.getPage(n);
+                if (PAGE_RATIO === 1) {
+                    const v = page.getViewport({ scale: 1 });
+                    PAGE_RATIO = v.height / v.width;
+                }
+                const canvas = document.createElement('canvas');
+                const vp = page.getViewport({ scale: 1 });        // bitmap 1× (we'll upscale via CSS)
+                canvas.width = vp.width; canvas.height = vp.height;
+                await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+
+                const wrap = document.createElement('div');
+                wrap.className = 'page'; wrap.style.width = vp.width + 'px'; wrap.style.height = vp.height + 'px';
+                wrap.appendChild(canvas);
+                bookEl.appendChild(wrap);
+            }
+
+            /* ---------- init StPageFlip ---------- */
+
+            let { w, h } = calcPageSize();
+            const pageFlip = new St.PageFlip(bookEl, {
+                width: w,
+                height: h,
+                usePortrait: false,     // stay in landscape
+                drawShadow: true,
+                flippingTime: 800
+            });
+
+
+            pageFlip.loadFromHTML(bookEl.querySelectorAll('.page'));
+            centreBook();
+            label.textContent = '1-2/' + totalPages;
+            pageFlip.on('changeState', () => hardSync());
+
+            window.addEventListener('resize', () => {
+                const { w, h } = calcPageSize();
+                pageFlip.update({ width: w, height: h });   // library’s built-in method
+                centreBook();
+            });
+
+
+            /* ---------- navigation ---------- */
+            pageFlip.on('flip', e => {
+                current = e.data;                    // left page index
+                const right = Math.min(current + 1, totalPages - 1) + 1;
+                label.textContent = `${current + 1}-${right}/${totalPages}`;
+            });
+
+            prevBtn.onclick = () => {
+                if (current === 0) return;
+                resetZoom();
+                pageFlip.flipPrev('top');
+            };
+
+            /* ---------- helper: enable corners only at 1× ---------- */
+            /* 2. Replace your syncUI helper with the two below */
+            function hardSync() {
+                // run only when engine is idle
+                if (pageFlip.getState() !== 'read') return;
+                softSync();                                       // refresh UI
+                pageFlip.update({ showPageCorners: SCALE === 1 }); // corners on/off
+            }
+
+            function softSync() {
+                zoomRange.value = SCALE;
+                zoomOut.disabled = SCALE <= 1;
+                zoomIn.disabled = SCALE >= 3;
+            }
+
+
+
+
+
+            function calcPageSize() {
+                // target two pages + 32px gap inside the stage
+                const gap = 32;
+                const avail = stage.clientWidth - gap;
+                let w = 426, h = 614;            // desktop base
+
+                if (avail < 2 * w) {             // phone: shrink proportionally
+                    w = Math.floor(avail / 2);
+                    h = Math.floor(w * (614 / 426));
+                }
+                return { w, h };
+            }
+
+
+            nextBtn.onclick = () => {
+                if (current + 2 > totalPages) return;
+                resetZoom();
+                pageFlip.flipNext('top');
+            };
+
+            /* ---------- zoom buttons ---------- */
+            const pointerPos = e => {
+                const r = stage.getBoundingClientRect();
+                return { x: e.clientX - r.left, y: e.clientY - r.top };
+            };
+
+            zoomIn.onclick = e => { zoomRange.stepUp(); zoomTo(+zoomRange.value, pointerPos(e)); };
+            zoomOut.onclick = e => { zoomRange.stepDown(); zoomTo(+zoomRange.value, pointerPos(e)); };
+            zoomRange.oninput = e => zoomTo(+e.target.value, { x: stage.clientWidth / 2, y: stage.clientHeight / 2 });
+            stage.addEventListener('wheel', e => {
+                if (!e.ctrlKey) return;
+                e.preventDefault();
+                let ns = +(SCALE + (e.deltaY > 0 ? -0.1 : 0.1)).toFixed(1);
+                ns = Math.min(Math.max(ns, 1), 3);
+                zoomTo(ns, pointerPos(e));
+            }, { passive: false });
+
+            /* ---------- pan ---------- */
+            stage.addEventListener('mousedown', e => {
+                if (SCALE === 1) return;
+                isPanning = true;
+                panStart = { x: e.clientX, y: e.clientY };
+                document.body.style.cursor = 'grabbing';
+            });
+            window.addEventListener('mousemove', e => {
+                if (!isPanning) return;
+                const dx = e.clientX - panStart.x, dy = e.clientY - panStart.y;
+                bookEl.style.left = (parseFloat(bookEl.style.left) || 0) + dx + 'px';
+                bookEl.style.top = (parseFloat(bookEl.style.top) || 0) + dy + 'px';
+                panStart = { x: e.clientX, y: e.clientY };
+            });
+            window.addEventListener('mouseup', () => {
+                isPanning = false; document.body.style.cursor = '';
+            });
+        });
+    </script>
+</body>
+
+</html>
