@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Render PDF (All Content)</title>
+    <style>
+        #pdf-container {
+            max-width: 800px;
+            margin: auto;
+        }
+
+        .pdf-page {
+            position: relative;
+            margin-bottom: 20px;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        .link-annotation {
+            position: absolute;
+            border: 2px solid rgba(0, 0, 255, 0.3);
+            cursor: pointer;
+            z-index: 10;
+        }
+    </style>
+</head>
+
+<body>
+    <h1 style="text-align: center;">Rendered PDF Viewer</h1>
+    <div id="pdf-container"></div>
+
+    <script src="./pdf.min.js"></script>
+    <script>
+        const url = './pdftest.pdf'; 
+        const container = document.getElementById('pdf-container');
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "./pdf.worker.min.js";
+
+        (async () => {
+            const pdf = await pdfjsLib.getDocument(url).promise;
+
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+
+                const pageDiv = document.createElement('div');
+                pageDiv.className = 'pdf-page';
+
+
+                const canvas = document.createElement('canvas');
+                const context = canvas.getContext('2d');
+                const viewport = page.getViewport({ scale: 1.5 });
+
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+
+                await page.render({ canvasContext: context, viewport }).promise;
+
+                pageDiv.appendChild(canvas);
+
+
+                const annotations = await page.getAnnotations();
+                const textContent = await page.getTextContent();
+                console.log('text:', textContent);
+
+                const textLayer = document.createElement('div');
+                textLayer.style.position = 'absolute';
+                textLayer.style.top = '0';
+                textLayer.style.left = '0';
+                textLayer.style.width = `${viewport.width}px`;
+                textLayer.style.height = `${viewport.height}px`;
+                textLayer.style.pointerEvents = 'none';
+                pageDiv.appendChild(textLayer);
+
+                textContent.items.forEach((item) => {
+                    const text = item.str;
+                    const transform = item.transform;
+                    const fontSize = Math.hypot(transform[0], transform[1]);
+
+                    const [x, y] = viewport.convertToViewportPoint(transform[4], transform[5]);
+
+                    const textEl = document.createElement('p');
+                    textEl.textContent = text;
+                    textEl.style.position = 'absolute';
+                    textEl.style.left = `${x}px`;
+                    textEl.style.top = `${y - fontSize}px`;
+                    textEl.style.fontSize = `${fontSize}px`;
+                    textEl.style.margin = '0';
+                    textEl.style.padding = '0';
+                    textEl.style.lineHeight = '1';
+                    textEl.style.whiteSpace = 'nowrap';
+                    textEl.style.backgroundColor = 'rgba(255,255,0,0.1)'; 
+
+                    textLayer.appendChild(textEl);
+                });
+
+
+            container.appendChild(pageDiv);
+        }
+        }) ();
+    </script>
+</body>
+
+</html>
