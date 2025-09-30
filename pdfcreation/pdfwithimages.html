@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Flipbook (no cache, revoke after load, 1× base, sharp on zoom)</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      background: #f6f7f9;
+      color: #111;
+    }
+
+    .toolbar,
+    .zoombar {
+      margin: 10px 0;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 4px 12px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+
+    .flipbook {
+      position: relative;
+      width: 100%;
+      max-width: 1400px;
+    }
+
+    .flipbook.fullscreen {
+      position: fixed;
+      inset: 0;
+      background: #000;
+      z-index: 9999;
+      max-width: none;
+    }
+
+    .stage {
+      width: 90vw;
+      height: 80vh;
+      position: relative;
+      overflow: hidden;
+      margin-top: 10px;
+      background: #1113;
+      border-radius: 8px;
+      box-shadow: 0 2px 20px #0002 inset;
+      cursor: grab;
+    }
+
+    .stage:active {
+      cursor: grabbing;
+    }
+
+    #viewport {
+      position: absolute;
+      left: 0;
+      top: 0;
+      transform-origin: 0 0;
+      display: flex;
+      gap: 0;
+      /* no gap */
+      will-change: transform;
+    }
+
+    img.page {
+      display: none;
+      /* only current spread is visible */
+      background: #fff;
+      border: 1px solid #ccc;
+      height: auto;
+      user-select: none;
+      -webkit-user-drag: none;
+      image-rendering: auto;
+      box-shadow: 0 1px 4px #0003;
+    }
+
+    img.page.visible {
+      display: block;
+    }
+
+    .tp {
+      height: 30vh;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="flipbook" id="flipBook">
+    <div class="toolbar">
+      <button id="prev">Prev</button>
+      <span id="pageLabel">1-2/0</span>
+      <button id="next">Next</button>
+    </div>
+
+    <div class="zoombar">
+      <button id="zoomOut">−</button>
+      <input id="zoomRange" type="range" min="1" max="2" step="0.1" value="1">
+      <button id="zoomIn">+</button>
+      <button id="fullBtn">🗖</button>
+    </div>
+
+    <div class="stage" id="stage" role="application" aria-label="PDF flipbook stage">
+      <div id="viewport"></div>
+    </div>
+  </div>
+
+  <div class="tp" aria-hidden="true"></div>
+
+  <!-- PDF.js (adjust paths as needed) -->
+  <script src="../pdf.min.js"></script>
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "../pdf.worker.min.js"; // OffscreenCanvas renders via PDF.js worker [web:12]
+
+    window.addEventListener("DOMContentLoaded", async () => {
+      // DOM
+      const stage = document.getElementById("stage");
+      const viewport = document.getElementById("viewport");
+      const prevBtn = document.getElementById("prev");
+      const nextBtn = document.getElementById("next");
+      const label = document.getElementById("pageLabel");
+      const zoomOut = document.getElementById("zoomOut");
+      const zoomIn = document.getElementById("zoomIn");
+      const zoomRange = document.getElementById("zoomRange");
+      const fullBtn = document.getElementById("fullBtn");
+      const flipBook = document.getElementById("flipBook");
+
+      // Config
+      const DPR = window.devicePixelRatio || 1;              // used for DPR×zoom sharpen [web:41]
+      const IS_MOBILE = matchMedia('(max-width:768px)').matches;
+      const STEP = IS_MOBILE ? 1 : 2;                        // single page on mobile, 2 on desktop [web:46]
+      const MAX_ZOOM = 2;                                    // clamp to 2× [web:46]
+      const MAX_BITMAP = 8192;                               // guard overlarge raster [web:69]
+      const BASE_RENDER = DPR;                               // base 1× DPR for normal view [web:41]
+
+      // State
+      let pdf, totalPages = 0;
+      let current = 1;
+      let PAGE_RATIO = 1;
+      let SCALE = 1;                                         // CSS zoom 1..2 [web:46]
+      let RENDER = BASE_RENDER;                              // DPR × SCALE used for sharpen [web:41]
+      const imgs = [];                                       // 1..N <img>
+
+      // Transform model: translate before scale
+      let panX = 0, panY = 0;
+
+      // Interaction
+      let isDragging = false;
+      let dragStart = null;
+      let lastPointer = { x: 0, y: 0 };
+      let zoomTimer = null;
+
+      // Helpers
+      const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+      const visiblePages = (center) => IS_MOBILE ? [center] : [center, Math.min(center + 1, totalPages)]; // show spread [web:46]
+
+      function updateVisibility(center) {
+        const vis = new Set(visiblePages(center));
+        for (let p = 1; p <= totalPages; p++) {
+          const img = imgs[p];
+          if (!img) continue;
+          if (vis.has(p)) img.classList.add('visible'); else img.classList.remove('visible');
+        }
+      } // toggle only current spread [web:46]
+
+      function updateLabel() {
+        if (IS_MOBILE) label.textContent = `${current}/${totalPages}`;
+        else label.textContent = `${current}-${Math.min(current + 1, totalPages)}/${totalPages}`;
+      } // label text [web:46]
+
+      function sizeImgForViewport(imgEl) {
+        const maxW = IS_MOBILE ? stage.clientWidth : (stage.clientWidth) / 2;
+        const maxH = stage.clientHeight;
+        let w = maxW, h = w * PAGE_RATIO;
+        if (h > maxH) { h = maxH; w = h / PAGE_RATIO; }
+        imgEl.style.width = w + 'px';
+        imgEl.style.height = h + 'px';
+      } // base-fit by ratio; zoom via transform only [web:132]
+
+      function setTransform() {
+        viewport.style.transform = `translate(${panX}px,${panY}px) scale(${SCALE})`;
+      } // translate then scale (order matters) [web:132]
+
+      function clampPan() {
+        const sw = stage.clientWidth;
+        const sh = stage.clientHeight;
+
+        // Layout size (pre-transform)
+        const contentW = viewport.offsetWidth;               // unaffected by transform [web:136]
+        const contentH = viewport.offsetHeight;              // unaffected by transform [web:136]
+
+        // Rendered size (after scale)
+        const cw = contentW * SCALE;
+        const ch = contentH * SCALE;
+
+        // Allowed pan ranges in pre-scale units with origin 0 0:
+        // oversized -> pan ∈ [ (stage - content)/SCALE, 0 ], undersized -> pan ∈ [ 0, (stage - content)/SCALE ]
+        const minX = Math.min(0, (sw - cw) / SCALE);
+        const maxX = Math.max(0, (sw - cw) / SCALE);
+        const minY = Math.min(0, (sh - ch) / SCALE);
+        const maxY = Math.max(0, (sh - ch) / SCALE);
+
+        panX = Math.min(Math.max(panX, minX), maxX);
+        panY = Math.min(Math.max(panY, minY), maxY);
+
+        viewport.style.transform = `translate(${panX}px,${panY}px) scale(${SCALE})`;
+      } // edge-sticky bounds using layout×scale size [web:136][web:132]
+
+      function canPanNow() {
+        const cw = viewport.offsetWidth * SCALE;
+        const ch = viewport.offsetHeight * SCALE;
+        return SCALE > 1 || cw > stage.clientWidth || ch > stage.clientHeight;
+      } // allow pan when zoomed or content exceeds stage [web:136]
+
+      function updateZoomButtons() {
+        zoomOut.disabled = SCALE <= 1;
+        zoomIn.disabled = SCALE >= MAX_ZOOM;
+      } // UI clamp [web:46]
+
+      // Render page -> Blob URL at scaleFactor; revoke new and old after the image load (no cache) [web:12][web:16]
+      async function renderPageToBlobURL(pageNum, scaleFactor) {
+        const page = await pdf.getPage(pageNum);
+        const baseVp = page.getViewport({ scale: 1 });
+        const maxByW = MAX_BITMAP / baseVp.width, maxByH = MAX_BITMAP / baseVp.height;
+        const effScale = Math.min(scaleFactor, maxByW, maxByH);
+        const vp = page.getViewport({ scale: effScale });
+        let blob;
+        try {
+          if (typeof OffscreenCanvas !== 'undefined') {
+            const off = new OffscreenCanvas(vp.width, vp.height);
+            const ctx = off.getContext('2d', { alpha: false });
+            ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, vp.width, vp.height);
+            const task = page.render({ canvasContext: ctx, viewport: vp });
+            await task.promise;
+            blob = await off.convertToBlob({ type: 'image/png' });
+          } else {
+            const c = Object.assign(document.createElement('canvas'), { width: vp.width, height: vp.height });
+            const ctx = c.getContext('2d', { alpha: false });
+            ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, vp.width, vp.height);
+            const task = page.render({ canvasContext: ctx, viewport: vp });
+            await task.promise;
+            blob = await new Promise(res => c.toBlob(res, 'image/png'));
+          }
+        } catch { return null; }
+        const url = URL.createObjectURL(blob);
+        return { url, vp };
+      } // OffscreenCanvas.convertToBlob / canvas.toBlob [web:12][web:69]
+
+      // Assign new blob URL to img and revoke both new and old after load; no decode, no cache [web:16]
+      async function assignBlobToImg(pageNum, scaleFactor) {
+        const img = imgs[pageNum];
+        if (!img) return;
+        const rec = await renderPageToBlobURL(pageNum, scaleFactor);
+        if (!rec) return;
+
+        if (PAGE_RATIO === 1) PAGE_RATIO = rec.vp.height / rec.vp.width;
+        sizeImgForViewport(img);
+
+        const nextUrl = rec.url;
+        const oldUrl = img.dataset.url || null;
+
+        img.onload = () => {
+          try { URL.revokeObjectURL(nextUrl); } catch { }
+          if (oldUrl && oldUrl !== nextUrl) { try { URL.revokeObjectURL(oldUrl); } catch { } }
+          img.onload = img.onerror = null;
+        }; // safe revoke-after-load to keep memory low while image displays [web:16]
+
+        img.onerror = () => {
+          try { URL.revokeObjectURL(nextUrl); } catch { }
+          img.onload = img.onerror = null;
+        };
+
+        if (img.dataset.url !== nextUrl) {
+          img.src = nextUrl;
+          img.dataset.url = nextUrl;
+        }
+      } // direct swap without decode, revoke after load [web:16]
+
+      async function renderAllBaseOnce() {
+        for (let p = 1; p <= totalPages; p++) {
+          await assignBlobToImg(p, BASE_RENDER); // base 1× DPR for every page [web:41]
+        }
+      } // initial pass, no cache retained [web:12]
+
+      // Pointer-anchored zoom; translate math in pre-scale units; clamp after transform [web:127][web:132]
+      function anchoredZoom(newScale, anchor) {
+        const oldS = SCALE, newS = newScale;
+        panX = panX + anchor.x * (1 / newS - 1 / oldS);
+        panY = panY + anchor.y * (1 / newS - 1 / oldS);
+        SCALE = newS; RENDER = SCALE * DPR;
+        viewport.style.transform = `translate(${panX}px,${panY}px) scale(${SCALE})`;
+        clampPan();
+      } // pointer-anchored translate(...) scale(...) [web:127][web:132]
+
+      function setInstantZoom(scale, origin) {
+        anchoredZoom(scale, origin);
+        updateZoomButtons();
+        zoomRange.value = scale;
+      } // visual feedback only; sharpen later [web:46]
+
+      // Render crisp DPR×zoom blobs for visible pages only once after zoom stops [web:41]
+      async function commitZoomSharpen() {
+        const vis = visiblePages(current);
+        await Promise.all(vis.map(p => assignBlobToImg(p, RENDER)));
+        if (SCALE === 1) centrePan();
+        clampPan();
+      } // trailing-only sharpen [web:41][web:46]
+
+      function scheduleZoomCommit() {
+        if (zoomTimer) clearTimeout(zoomTimer);
+        zoomTimer = setTimeout(commitZoomSharpen, 200);
+      } // debounce zoom end [web:46]
+
+      // Load PDF
+      const pdfPath = "../test.pdf";
+      pdf = await pdfjsLib.getDocument(pdfPath).promise; // open document [web:12]
+      totalPages = pdf.numPages;
+
+      // Aspect ratio probe from page 1
+      {
+        const first = await pdf.getPage(1);
+        const vp0 = first.getViewport({ scale: 1 });
+        PAGE_RATIO = vp0.height / vp0.width;
+      } // base-fit math [web:69]
+
+      // Build all page images
+      for (let p = 1; p <= totalPages; p++) {
+        const img = document.createElement('img');
+        img.className = 'page';
+        img.alt = `Page ${p}`;
+        viewport.appendChild(img);
+        imgs[p] = img;
+      } // one <img> per page [web:46]
+
+      // Base 1× DPR blobs (revoke after load), show first spread, center and clamp
+      await renderAllBaseOnce();
+      updateVisibility(current);
+      visiblePages(current).forEach(p => imgs[p] && sizeImgForViewport(imgs[p]));
+      updateLabel(); updateZoomButtons();
+      // Center at current scale using layout×scale sizing
+      (function centrePan() {
+        const sw = stage.clientWidth, sh = stage.clientHeight;
+        const cw = viewport.offsetWidth * SCALE;
+        const ch = viewport.offsetHeight * SCALE;
+        panX = (sw - cw) / (2 * SCALE);
+        panY = (sh - ch) / (2 * SCALE);
+        viewport.style.transform = `translate(${panX}px,${panY}px) scale(${SCALE})`;
+        clampPan();
+      })(); // initial center with clamp [web:136][web:132]
+
+      // Navigation: snap to 1× and re-render only visible pages at base 1× (fresh blobs), then show next spread [web:41]
+      async function goTo(delta) {
+        if (SCALE !== 1) {
+          const origin = { x: stage.clientWidth / 2, y: stage.clientHeight / 2 };
+          setInstantZoom(1, origin);             // snap visual to 1× [web:46]
+          await commitZoomSharpen();             // render visible at DPR×1 (fresh base) [web:41]
+        }
+        const nextLeft = current + delta;
+        if (nextLeft < 1 || nextLeft > totalPages) return;
+        current = nextLeft;
+
+        updateVisibility(current);
+        visiblePages(current).forEach(p => imgs[p] && sizeImgForViewport(imgs[p]));
+        // Ensure the newly visible pages are base 1× by rendering fresh blobs (revoke after load)
+        await Promise.all(visiblePages(current).map(p => assignBlobToImg(p, BASE_RENDER))); // back to 1× [web:41]
+        updateLabel();
+        // Re-center at 1× baseline
+        const sw = stage.clientWidth, sh = stage.clientHeight;
+        const cw = viewport.offsetWidth * SCALE;
+        const ch = viewport.offsetHeight * SCALE;
+        panX = (sw - cw) / (2 * SCALE);
+        panY = (sh - ch) / (2 * SCALE);
+        viewport.style.transform = `translate(${panX}px,${panY}px) scale(${SCALE})`;
+        clampPan();
+      } // single-click Next/Prev baseline at 1× [web:46]
+
+      prevBtn.onclick = () => goTo(-STEP);
+      nextBtn.onclick = () => goTo(+STEP);
+
+      // Pointer tracking for zoom anchor [web:46]
+      stage.addEventListener('mousemove', (e) => {
+        const r = stage.getBoundingClientRect();
+        lastPointer = { x: e.clientX - r.left, y: e.clientY - r.top };
+      }, { passive: true });
+      stage.addEventListener('touchstart', (e) => {
+        const t = e.touches[0], r = stage.getBoundingClientRect();
+        lastPointer = { x: t.clientX - r.left, y: t.clientY - r.top };
+      }, { passive: true });
+
+      // Ctrl+wheel pointer-anchored zoom (visual), trailing sharpen of visible pages [web:46]
+      viewport.addEventListener('wheel', (e) => {
+        if (!e.ctrlKey) return;
+        e.preventDefault();
+        const r = stage.getBoundingClientRect();
+        const origin = { x: e.clientX - r.left, y: e.clientY - r.top };
+        const ns = clamp(SCALE + (e.deltaY > 0 ? -0.1 : 0.1), 1, MAX_ZOOM);
+        setInstantZoom(+ns.toFixed(1), origin);
+        scheduleZoomCommit();
+      }, { passive: false }); // wheel event [web:46]
+
+      // Buttons/slider zoom use lastPointer as anchor [web:46]
+      zoomIn.onclick = (e) => {
+        const r = stage.getBoundingClientRect();
+        const origin = { x: e.clientX - r.left, y: e.clientY - r.top };
+        setInstantZoom(clamp(SCALE + 0.1, 1, MAX_ZOOM), origin);
+        scheduleZoomCommit();
+      };
+      zoomOut.onclick = (e) => {
+        const r = stage.getBoundingClientRect();
+        const origin = { x: e.clientX - r.left, y: e.clientY - r.top };
+        setInstantZoom(clamp(SCALE - 0.1, 1, MAX_ZOOM), origin);
+        scheduleZoomCommit();
+      };
+      zoomRange.oninput = (e) => {
+        setInstantZoom(clamp(+e.target.value, 1, MAX_ZOOM), lastPointer);
+        scheduleZoomCommit();
+      };
+
+      // Drag / Pan: convert screen deltas to pre-scale units, then clamp [web:127][web:132]
+      viewport.addEventListener("mousedown", (e) => {
+        if (!canPanNow()) return;
+        isDragging = true;
+        dragStart = { x: e.clientX, y: e.clientY };
+        document.body.style.cursor = "grabbing";
+      });
+      window.addEventListener("mousemove", (e) => {
+        if (!isDragging || !dragStart) return;
+        const dx = (e.clientX - dragStart.x) / SCALE;      // pre-scale units [web:132]
+        const dy = (e.clientY - dragStart.y) / SCALE;      // pre-scale units [web:132]
+        dragStart.x = e.clientX; dragStart.y = e.clientY;
+        panX += dx; panY += dy;
+        clampPan();
+      });
+      window.addEventListener("mouseup", () => {
+        if (!isDragging) return;
+        isDragging = false;
+        dragStart = null;
+        document.body.style.cursor = "";
+      });
+
+      // Touch pan: same pre-scale conversion and clamping [web:132]
+      viewport.addEventListener("touchstart", (e) => {
+        if (!canPanNow()) return;
+        const t = e.touches[0]; dragStart = { x: t.clientX, y: t.clientY };
+      }, { passive: true });
+      stage.addEventListener("touchmove", (e) => {
+        if (!dragStart) return;
+        const t = e.touches[0];
+        const dx = (t.clientX - dragStart.x) / SCALE;      // pre-scale units [web:132]
+        const dy = (t.clientY - dragStart.y) / SCALE;      // pre-scale units [web:132]
+        dragStart.x = t.clientX; dragStart.y = t.clientY;
+        panX += dx; panY += dy;
+        clampPan();
+        e.preventDefault();
+      }, { passive: false });
+      stage.addEventListener("touchend", () => { dragStart = null; });
+
+      // Fullscreen
+      fullBtn.onclick = () => { if (!document.fullscreenElement) flipBook.requestFullscreen(); else document.exitFullscreen(); };
+
+      document.addEventListener("fullscreenchange", () => {
+        flipBook.classList.toggle("fullscreen", !!document.fullscreenElement);
+      });
+
+      // Cleanup: revoke any URLs still on <img> (normally revoked on load already) [web:16]
+      window.addEventListener('beforeunload', () => {
+        for (let p = 1; p <= totalPages; p++) {
+          const img = imgs[p];
+          if (img && img.dataset.url) { try { URL.revokeObjectURL(img.dataset.url); } catch { } }
+        }
+      });
+
+      // Resize: re-size visible pages, then re-center and clamp with layout×scale sizing [web:136][web:132]
+      window.addEventListener('resize', () => {
+        visiblePages(current).forEach(p => imgs[p] && sizeImgForViewport(imgs[p]));
+        const sw = stage.clientWidth, sh = stage.clientHeight;
+        const cw = viewport.offsetWidth * SCALE;
+        const ch = viewport.offsetHeight * SCALE;
+        panX = (sw - cw) / (2 * SCALE);
+        panY = (sh - ch) / (2 * SCALE);
+        viewport.style.transform = `translate(${panX}px,${panY}px) scale(${SCALE})`;
+        clampPan();
+      });
+    });
+  </script>
+</body>
+
+</html>

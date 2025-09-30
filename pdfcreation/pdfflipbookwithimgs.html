@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Flipbook (animated prev/next, width/height from img)</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/page-flip@2.0.7/src/Style/stPageFlip.min.css">
+    <style>
+        :root {
+            color-scheme: light;
+        }
+
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background: #f6f7f9;
+            color: #111;
+        }
+
+        .toolbar,
+        .zoombar {
+            margin: 10px 0;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 4px 12px;
+            font-size: 15px;
+            cursor: pointer;
+        }
+
+        .flipbook {
+            position: relative;
+            width: 100%;
+            max-width: 1400px;
+        }
+
+        .flipbook.fullscreen {
+            position: fixed;
+            inset: 0;
+            background: #000;
+            z-index: 9999;
+            max-width: none;
+        }
+
+        .stage {
+            width: 90vw;
+            height: 80vh;
+            position: relative;
+            overflow: hidden;
+            margin-top: 10px;
+            background: #1113;
+            border-radius: 8px;
+            box-shadow: 0 2px 20px #0002 inset;
+            cursor: default;
+            /* not draggable at 1× */
+            touch-action: none;
+            /* we manage panning at zoom */
+        }
+
+        .stage.can-pan {
+            cursor: grab;
+        }
+
+        .stage.can-pan:active {
+            cursor: grabbing;
+        }
+
+        /* Zoom/pan is applied to #viewport (the PageFlip root) */
+        #viewport {
+            position: absolute;
+            left: 0;
+            top: 0;
+            transform-origin: 0 0;
+            will-change: transform;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* IMPORTANT: do not hide pages; PageFlip measures/positions them */
+        img.page {
+            display: block;
+            background: #fff;
+            border: 1px solid #ccc;
+            height: auto;
+            user-select: none;
+            -webkit-user-drag: none;
+            image-rendering: auto;
+            box-shadow: 0 1px 4px #0003;
+            max-width: 100%;
+        }
+
+        /* Optional: a shield that captures drags when zoomed so flips don’t trigger */
+        .pan-shield {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            /* disabled at 1× */
+        }
+
+        .pan-shield.active {
+            pointer-events: auto;
+            /* enabled when SCALE>1 */
+            cursor: grab;
+        }
+
+        /* Smooth reveal */
+        img.page {
+            transition: opacity 180ms ease-in;
+            opacity: 1;
+            /* will set to 0 during load via JS */
+        }
+
+        /* Skeleton shimmer while loading */
+        img.page.skeleton {
+            background:
+                linear-gradient(100deg,
+                    #e9ecef 0%,
+                    #e9ecef 40%,
+                    #f5f7f9 55%,
+                    #e9ecef 70%,
+                    #e9ecef 100%);
+            background-size: 200% 100%;
+            animation: sk-shimmer 1.2s ease-in-out infinite;
+        }
+
+        /* Optional: rounded look */
+        img.page.skeleton {
+            border-radius: 4px;
+        }
+
+        @keyframes sk-shimmer {
+            0% {
+                background-position-x: 200%;
+            }
+
+            100% {
+                background-position-x: 0%;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="flipbook" id="flipBook">
+        <div class="toolbar">
+            <button id="prev">Prev</button>
+            <span id="pageLabel">1-2/0</span>
+            <button id="next">Next</button>
+        </div>
+
+        <div class="zoombar">
+            <button id="zoomOut">−</button>
+            <input id="zoomRange" type="range" min="1" max="2" step="0.1" value="1">
+            <button id="zoomIn">+</button>
+            <button id="fullBtn">🗖</button>
+        </div>
+
+        <div class="stage" id="stage" role="application" aria-label="PDF flipbook stage">
+            <div id="viewport"></div>
+            <div id="panShield" class="pan-shield"></div>
+        </div>
+    </div>
+
+    <!-- PDF.js (use local paths appropriate for deployment) -->
+    <script src="../pdf.min.js"></script>
+    <!-- StPageFlip -->
+    <script src="https://cdn.jsdelivr.net/npm/page-flip@2.0.7/dist/js/page-flip.browser.min.js"></script>
+
+    <script>
+        // PDF.js worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "../pdf.worker.min.js"; // worker setup [web:13]
+
+        window.addEventListener("DOMContentLoaded", async () => {
+            // DOM
+            const stage = document.getElementById("stage");
+            const viewport = document.getElementById("viewport");
+            const prevBtn = document.getElementById("prev");
+            const nextBtn = document.getElementById("next");
+            const label = document.getElementById("pageLabel");
+            const zoomOut = document.getElementById("zoomOut");
+            const zoomIn = document.getElementById("zoomIn");
+            const zoomRange = document.getElementById("zoomRange");
+            const fullBtn = document.getElementById("fullBtn");
+            const flipBook = document.getElementById("flipBook");
+            const panShield = document.getElementById("panShield");
+            const pdfPath = "../test.pdf";
+
+
+            // Config
+            const DPR = Math.min(window.devicePixelRatio || 1, 3);         // rendering crispness [web:13]
+            const IS_MOBILE = matchMedia('(max-width:768px)').matches;     // single vs spread [web:1]
+            const STEP = IS_MOBILE ? 1 : 2;                                 // navigation step [web:1]
+            const MAX_ZOOM = 2;                                            // CSS zoom clamp [web:8]
+            const MAX_BITMAP = 8192;                                       // bitmap guard [web:13]
+            const BASE_RENDER = DPR;                                       // base render scale [web:13]
+            const PRE_BEFORE_DESKTOP = 4, PRE_AFTER_DESKTOP = 4;           // keep window desktop [web:1]
+            const PRE_BEFORE_MOBILE = 2, PRE_AFTER_MOBILE = 2;             // keep window mobile [web:1]
+            const MAX_CONCURRENCY = 3;                                     // render pool [web:13]
+            const CLAMP_PEEK = 0.05; // 5% of content must remain visible [web:99]
+            const CLAMP_MARGIN = 0;
+            // State
+            let pdf, totalPages = 0;
+            let current = 1; // left page on desktop; current on mobile [web:1]
+            let PAGE_RATIO = 1;
+            let SCALE = 1;   // CSS-only zoom [web:8]
+            let panX = 0, panY = 0;
+            const imgs = []; // <img> per page [web:1]
+            const pageState = new Map(); // p -> { token:number, renderTask?:RenderTask } [web:10]
+            let isDragging = false, dragStart = null;
+            let lastPointer = { x: 0, y: 0 };
+            let pageFlip = null;
+
+            // Encoder selection (OffscreenCanvas/WebP fallbacks)
+            const ENCODER = await pickBitmapEncoder(); // export pipeline [web:13]
+
+            // Helpers
+            const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi); // utility [web:13]
+            const visiblePages = (center) => IS_MOBILE ? [center] : [center, Math.min(center + 1, totalPages)]; // spread [web:1]
+
+            function updateLabel() {
+                label.textContent = IS_MOBILE
+                    ? `${current}/${totalPages}`
+                    : `${current}-${Math.min(current + 1, totalPages)}/${totalPages}`; // UI [web:1]
+            }
+
+            function updateZoomButtons() {
+                zoomOut.disabled = SCALE <= 1;
+                zoomIn.disabled = SCALE >= MAX_ZOOM; // UI [web:8]
+            }
+
+            function sizeImgForViewport(imgEl) {
+                const maxW = IS_MOBILE ? stage.clientWidth : (stage.clientWidth) / 2;
+                const maxH = stage.clientHeight;
+                let w = maxW, h = w * PAGE_RATIO;
+                if (h > maxH) { h = maxH; w = h / PAGE_RATIO; }
+                imgEl.style.width = w + 'px';
+                imgEl.style.height = h + 'px'; // base CSS size [web:8]
+            }
+
+            function setTransform() {
+                viewport.style.transform = `translate(${panX}px,${panY}px) scale(${SCALE})`; // translate then scale [web:8]
+            }
+
+            function clampViewport() {
+                const sw = stage.clientWidth, sh = stage.clientHeight;                  // stage size [web:99]
+                const cw = viewport.offsetWidth * SCALE;                                // scaled content width [web:99]
+                const ch = viewport.offsetHeight * SCALE;                               // scaled content height [web:99]
+
+                let minX = -(cw - cw * CLAMP_PEEK) - CLAMP_MARGIN;                      // left bound (scaled) [web:99]
+                let maxX = sw - cw * CLAMP_PEEK + CLAMP_MARGIN;                        // right bound (scaled) [web:99]
+                let minY = -(ch - ch * CLAMP_PEEK) - CLAMP_MARGIN;                      // top bound (scaled) [web:99]
+                let maxY = sh - ch * CLAMP_PEEK + CLAMP_MARGIN;                        // bottom bound (scaled) [web:99]
+                if (maxX < minX) [minX, maxX] = [maxX, minX];                           // swap if needed [web:99]
+                if (maxY < minY) [minY, maxY] = [maxY, minY];                           // swap if needed [web:99]
+
+                const sx = panX * SCALE, sy = panY * SCALE;                              // current scaled translation [web:99]
+                const csx = Math.min(Math.max(sx, minX), maxX);                          // clamp scaled X [web:99]
+                const csy = Math.min(Math.max(sy, minY), maxY);                          // clamp scaled Y [web:99]
+                if (csx !== sx) panX = csx / SCALE;                                      // convert back to panX [web:99]
+                if (csy !== sy) panY = csy / SCALE;                                      // convert back to panY [web:99]
+                setTransform();                                                          // apply translate(...) scale(...) [web:99]
+            }
+
+            function centrePanExact() {
+                visiblePages(current).forEach(p => imgs[p] && sizeImgForViewport(imgs[p])); // ensure widths [web:8]
+                const sw = stage.clientWidth, sh = stage.clientHeight;
+                const cw = viewport.offsetWidth * SCALE;
+                const ch = viewport.offsetHeight * SCALE;
+                panX = (sw - cw) / (2 * SCALE);
+                panY = (sh - ch) / (2 * SCALE);
+                setTransform(); // center at any zoom [web:8]
+            }
+
+            function canPanNow() {
+                return SCALE > 1; // drag only when zoomed [web:8]
+            }
+
+            function anchoredZoom(newScale, anchor) {
+                const oldS = SCALE, newS = newScale;
+                panX = panX + anchor.x * (1 / newS - 1 / oldS);
+                panY = panY + anchor.y * (1 / newS - 1 / oldS);
+                SCALE = newS;
+                setTransform();
+                updateZoomButtons();
+                zoomRange.value = String(SCALE);
+                stage.classList.toggle('can-pan', SCALE > 1);
+                panShield.classList.toggle('active', SCALE > 1); // intercept flips while panning [web:8]
+                clampViewport()
+                if (SCALE === 1) { centrePanExact(); } // auto-center [web:8]
+            }
+
+            function setInstantZoom(scale, origin) {
+                anchoredZoom(scale, origin); // CSS-only zoom [web:8]
+            }
+
+            function buildImages() {
+                for (let p = 1; p <= totalPages; p++) {
+                    const img = document.createElement('img');
+                    img.className = 'page';
+                    img.alt = `Page ${p}`;
+                    viewport.appendChild(img);
+                    imgs[p] = img;
+                } // one <img> per page [web:1]
+            }
+
+            function computeKeep(center) {
+                const core = visiblePages(center);
+                const minCore = Math.min(...core), maxCore = Math.max(...core);
+                const before = IS_MOBILE ? PRE_BEFORE_MOBILE : PRE_BEFORE_DESKTOP;
+                const after = IS_MOBILE ? PRE_AFTER_MOBILE : PRE_AFTER_DESKTOP;
+                const from = Math.max(1, minCore - before);
+                const to = Math.min(totalPages, maxCore + after);
+                const keep = new Set();
+                for (let p = from; p <= to; p++) keep.add(p);
+                return { core, keep }; // window to keep in memory [web:1]
+            }
+
+            async function mapPool(items, limit, fn) {
+                const q = items.slice();
+                const runners = new Array(Math.min(limit, q.length)).fill(0).map(async function run() {
+                    while (q.length) { const it = q.shift(); await fn(it); }
+                });
+                await Promise.all(runners);
+            } // concurrency pool [web:13]
+
+
+            async function assignBlobToImgSafe(pageNum, scaleFactor) {
+                const img = imgs[pageNum];
+                if (!img) return;                                                 // guard [web:131]
+
+                const st = pageState.get(pageNum) || { token: 0, renderTask: null };
+                st.token++;
+                const myToken = st.token;
+                if (st.renderTask && typeof st.renderTask.cancel === 'function') {
+                    try { st.renderTask.cancel(); } catch { }                        // cancel prior render [web:1]
+                }
+                pageState.set(pageNum, st);
+
+                const page = await pdf.getPage(pageNum);                          // get PDF page [web:1]
+                const baseVp = page.getViewport({ scale: 1 });
+                const effScale = Math.min(scaleFactor, MAX_BITMAP / baseVp.width, MAX_BITMAP / baseVp.height);
+                const vp = page.getViewport({ scale: effScale });                 // target size [web:1]
+
+                let blob, renderTask;
+                try {
+                    if (ENCODER.useOffscreen) {
+                        const off = new OffscreenCanvas(vp.width, vp.height);
+                        const ctx = off.getContext('2d', { alpha: false });
+                        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, vp.width, vp.height);
+                        renderTask = page.render({ canvasContext: ctx, viewport: vp }); // RenderTask [web:1]
+                        st.renderTask = renderTask;
+                        await renderTask.promise;                                       // wait render [web:1]
+                        blob = await off.convertToBlob({ type: ENCODER.type, quality: ENCODER.quality }); // export [web:131]
+                    } else {
+                        const c = Object.assign(document.createElement('canvas'), { width: vp.width, height: vp.height });
+                        const ctx = c.getContext('2d', { alpha: false });
+                        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, vp.width, vp.height);
+                        renderTask = page.render({ canvasContext: ctx, viewport: vp }); // RenderTask [web:1]
+                        st.renderTask = renderTask;
+                        await renderTask.promise;                                       // wait render [web:1]
+                        blob = await new Promise(res => c.toBlob(res, ENCODER.type, ENCODER.quality));   // export [web:131]
+                    }
+                } catch {
+                    return;                                                           // canceled/failed [web:1]
+                }
+
+                // stale guard (pre-URL)
+                if ((pageState.get(pageNum)?.token ?? 0) !== myToken) return;       // ignore superseded [web:132]
+
+                const nextUrl = URL.createObjectURL(blob);                          // new object URL [web:131]
+                const oldUrl = img.dataset.url || null;
+
+                if (PAGE_RATIO === 1) PAGE_RATIO = vp.height / vp.width;            // layout ratio [web:131]
+                sizeImgForViewport(img);                                            // size box [web:32]
+
+                // prepare reveal
+                img.style.opacity = '0';                                            // fade-in path [web:124]
+                img.classList.add('skeleton');                                      // ensure shimmer during decode [web:127]
+                if (!img.decoding) img.decoding = 'async';                          // decode hint [web:130]
+
+                // assign src BEFORE decode
+                img.src = nextUrl;                                                  // set new pixels [web:131]
+                img.dataset.url = nextUrl;                                          // track current [web:131]
+
+                try {
+                    if (img.decode) {
+                        await img.decode();                                             // wait for decode [web:124]
+                    } else {
+                        await new Promise((res, rej) => {
+                            img.onload = () => { res(); };                                // resolve on load [web:131]
+                            img.onerror = () => { rej(new Error('img load failed')); };   // reject on error [web:131]
+                        });
+                    }
+                } catch {
+                    // On failure, keep skeleton; do not flip opacity [web:124]
+                    return;
+                } finally {
+                    // clear handlers set in fallback
+                    img.onload = img.onerror = null;                                  // cleanup [web:131]
+                }
+
+                // stale guard (post-decode)
+                if ((pageState.get(pageNum)?.token ?? 0) !== myToken) {
+                    try { URL.revokeObjectURL(nextUrl); } catch { }                    // free unused [web:131]
+                    return;
+                }
+
+                // reveal and cleanup
+                img.classList.remove('skeleton');                                   // stop shimmer [web:127]
+                img.style.opacity = '1';                                            // visible [web:124]
+                if (oldUrl && oldUrl !== nextUrl) { try { URL.revokeObjectURL(oldUrl); } catch { } } // free prior [web:131]
+            }
+
+            async function ensureCoreThenNeighbors(center) {
+                const { core, keep } = computeKeep(center);
+                // render visible first
+                await Promise.all(core.map(p => {
+                    const img = imgs[p];
+                    return (img && !img.dataset.url) ? assignBlobToImgSafe(p, BASE_RENDER) : Promise.resolve();
+                })); // visible pages ready [web:1]
+                // neighbors in background
+                const neighbors = Array.from(keep)
+                    .filter(p => !core.includes(p))
+                    .filter(p => !imgs[p]?.dataset.url);
+                mapPool(neighbors, MAX_CONCURRENCY, p => assignBlobToImgSafe(p, BASE_RENDER)); // prefetch [web:13]
+            }
+
+            function evictOutsideKeep(center) {
+                const { keep } = computeKeep(center);
+                for (let p = 1; p <= totalPages; p++) {
+                    if (keep.has(p)) continue;                                      // keep window [web:132]
+                    const img = imgs[p];
+                    if (!img) continue;                                             // guard [web:131]
+                    const url = img.dataset?.url;
+                    if (url) { try { URL.revokeObjectURL(url); } catch { } }         // free blob after eviction [web:131]
+                    img.removeAttribute('data-url');
+                    img.removeAttribute('src');                                     // allow GC [web:131]
+                    img.classList.add('skeleton');                                  // show shimmer next time [web:127]
+                    img.style.opacity = '1';                                        // shimmer visible [web:127]
+                    const st = pageState.get(p);
+                    if (st?.renderTask && typeof st.renderTask.cancel === 'function') {
+                        try { st.renderTask.cancel(); } catch { }                      // stop PDF.js render [web:1]
+                    }
+                }
+            }
+
+            // Load PDF
+            pdf = await pdfjsLib.getDocument(pdfPath).promise; // open [web:13]
+            totalPages = pdf.numPages; // count [web:13]
+
+            // Aspect ratio probe
+            {
+                const first = await pdf.getPage(1);
+                const vp0 = first.getViewport({ scale: 1 });
+                PAGE_RATIO = vp0.height / vp0.width; // layout ratio [web:13]
+            }
+
+            // Build DOM pages
+            buildImages(); // create all <img> [web:1]
+
+            // Render current spread/single first
+            await ensureCoreThenNeighbors(current); // bitmaps ready [web:1]
+
+            // Center at 1×
+            centrePanExact(); // exact center [web:8]
+            updateLabel(); updateZoomButtons(); // UI [web:1]
+
+            // Measure the first visible page to set PageFlip width/height
+            const firstVisibleIndex = IS_MOBILE ? current : current; // left page on desktop [web:1]
+            const firstEl = imgs[firstVisibleIndex];
+            if (firstEl && firstEl.decode) { try { await firstEl.decode(); } catch { } } // safe measure [web:8]
+            const baseW = Math.round(firstEl.clientWidth || 550);
+            const baseH = Math.round(firstEl.clientHeight || Math.round(baseW * PAGE_RATIO));
+
+            // Create PageFlip with measured dimensions
+            pageFlip = new St.PageFlip(
+                document.getElementById("viewport"),
+                {
+                    width: baseW,               // match <img> width (single page) [web:1]
+                    height: baseH,              // match <img> height (single page) [web:1]
+                    maxShadowOpacity: 0.5,
+                    showCover: true,
+                    mobileScrollSupport: false
+                }
+            ); // PageFlip instance [web:1]
+
+            // Load from the existing HTML images
+            pageFlip.loadFromHTML(document.querySelectorAll(".page")); // HTML mode [web:8]
+
+            // After: pageFlip.loadFromHTML(document.querySelectorAll(".page"));
+
+            try {
+                const firstPage = pageFlip.getPage(0);            // Page object for index 0 [web:3]
+                if (firstPage) {
+                    if (typeof firstPage.setDensity === 'function') {
+                        firstPage.setDensity('soft');                 // constant density soft [web:46]
+                    } else if (typeof firstPage.setDrawingDensity === 'function') {
+                        firstPage.setDrawingDensity('soft');          // temp density soft [web:46]
+                    }
+                }
+            } catch { /* no-op if method not available */ }
+
+
+            // Animated navigation via PageFlip
+            prevBtn.onclick = () => {
+                if (SCALE !== 1) anchoredZoom(1, { x: stage.clientWidth / 2, y: stage.clientHeight / 2 }); // snap 1× [web:8]
+                pageFlip.flipPrev('top'); // animated prev [web:8]
+            };
+            nextBtn.onclick = () => {
+                if (SCALE !== 1) anchoredZoom(1, { x: stage.clientWidth / 2, y: stage.clientHeight / 2 }); // snap 1× [web:8]
+                pageFlip.flipNext('top'); // animated next [web:8]
+            };
+
+            // Keep PDF state in sync with PageFlip events
+            pageFlip.on('flip', async (e) => {
+                const flipIndex = e.data;      // 0-based current page index [web:2]
+                const pdfPage = flipIndex + 1; // map to 1-based PDF page [web:2]
+                // Left page for spreads with cover
+                const leftPdfPage = IS_MOBILE ? pdfPage : (pdfPage === 1 ? 1 : (pdfPage % 2 === 0 ? pdfPage : pdfPage - 1)); // spread map [web:8]
+                current = leftPdfPage; // update logical current [web:2]
+
+                await ensureCoreThenNeighbors(current); // render visible + neighbors [web:1]
+                evictOutsideKeep(current); // memory control [web:1]
+                updateLabel(); // UI [web:1]
+            });
+
+            // Optional: respond to updates/orientation changes if needed
+            pageFlip.on('update', () => { /* can re-center/adjust if needed */ }); // update hook [web:2]
+            pageFlip.on('changeOrientation', () => { centrePanExact(); }); // keep centered [web:2]
+
+            // Pointer tracking for anchored zoom
+            stage.addEventListener('mousemove', (e) => {
+                const r = stage.getBoundingClientRect();
+                lastPointer = { x: e.clientX - r.left, y: e.clientY - r.top };
+            }, { passive: true }); // pointer [web:8]
+
+            stage.addEventListener('touchstart', (e) => {
+                const t = e.touches[0], r = stage.getBoundingClientRect();
+                lastPointer = { x: t.clientX - r.left, y: t.clientY - r.top };
+            }, { passive: true }); // pointer [web:8]
+
+            // Ctrl+wheel: CSS-only zoom
+            stage.addEventListener('wheel', (e) => {
+                if (!e.ctrlKey) return;
+                e.preventDefault();
+                const r = stage.getBoundingClientRect();
+                const origin = { x: e.clientX - r.left, y: e.clientY - r.top };
+                const ns = clamp(SCALE + (e.deltaY > 0 ? -0.1 : 0.1), 1, MAX_ZOOM);
+                setInstantZoom(+ns.toFixed(1), origin); // CSS transform [web:8]
+            }, { passive: false });
+
+            // UI zoom
+            zoomIn.onclick = (e) => {
+                const r = stage.getBoundingClientRect();
+                const origin = { x: e.clientX - r.left, y: e.clientY - r.top };
+                setInstantZoom(clamp(SCALE + 0.1, 1, MAX_ZOOM), origin); // CSS transform [web:8]
+            };
+            zoomOut.onclick = (e) => {
+                const r = stage.getBoundingClientRect();
+                const origin = { x: e.clientX - r.left, y: e.clientY - r.top };
+                setInstantZoom(clamp(SCALE - 0.1, 1, MAX_ZOOM), origin); // CSS transform [web:8]
+            };
+            zoomRange.oninput = (e) => { setInstantZoom(clamp(+e.target.value, 1, MAX_ZOOM), lastPointer); }; // CSS transform [web:8]
+
+            // Pan when zoomed: use the shield to avoid accidental flips
+            panShield.addEventListener("mousedown", (e) => {
+                if (!canPanNow()) return;
+                isDragging = true;
+                dragStart = { x: e.clientX, y: e.clientY };
+                document.body.style.cursor = "grabbing";
+                e.preventDefault();
+            });
+            window.addEventListener("mousemove", (e) => {
+                if (!isDragging || !dragStart) return;
+                const dx = (e.clientX - dragStart.x) / SCALE;
+                const dy = (e.clientY - dragStart.y) / SCALE;
+                dragStart.x = e.clientX; dragStart.y = e.clientY;
+                panX += dx; panY += dy;
+                clampViewport();
+            }, { capture: true });
+            window.addEventListener("mouseup", () => {
+                if (!isDragging) return;
+                isDragging = false;
+                dragStart = null;
+                document.body.style.cursor = "";
+            });
+
+            // Touch pan on shield
+            panShield.addEventListener("touchstart", (e) => {
+                if (!canPanNow()) return;
+                const t = e.touches[0]; dragStart = { x: t.clientX, y: t.clientY };
+            }, { passive: true });
+            panShield.addEventListener("touchmove", (e) => {
+                if (!dragStart) return;
+                const t = e.touches[0];
+                const dx = (t.clientX - dragStart.x) / SCALE;
+                const dy = (t.clientY - dragStart.y) / SCALE;
+                dragStart.x = t.clientX; dragStart.y = t.clientY;
+                panX += dx; panY += dy;
+                clampViewport();
+                e.preventDefault();
+            }, { passive: false });
+            panShield.addEventListener("touchend", () => { dragStart = null; }, { passive: true });
+
+            // Fullscreen
+            fullBtn.onclick = () => { if (!document.fullscreenElement) flipBook.requestFullscreen(); else document.exitFullscreen(); }; // UI [web:1]
+            document.addEventListener("fullscreenchange", () => {
+                flipBook.classList.toggle("fullscreen", !!document.fullscreenElement); // UI [web:1]
+                // Re-center after fullscreen toggles
+                setTimeout(() => { centrePanExact(); }, 0); // layout settle [web:1]
+            });
+
+            // Cleanup: revoke any active object URLs on unload
+            window.addEventListener('beforeunload', () => {
+                for (let p = 1; p <= totalPages; p++) {
+                    const img = imgs[p];
+                    if (img && img.dataset.url) { try { URL.revokeObjectURL(img.dataset.url); } catch { } }
+                } // safe lifecycle [web:13]
+            });
+
+            // Resize: re-center and ask PageFlip to re-measure from HTML
+            window.addEventListener('resize', () => {
+                centrePanExact();                                                         // recenter [web:3]
+                clampViewport();
+                if (pageFlip) {
+                    // Recompute base size from current page element, then update
+                    const el = imgs[IS_MOBILE ? current : current];
+                    if (el) {
+                        if (el.decode) { el.decode().catch(() => { }); }
+                        sizeImgForViewport(el);
+                    }
+                    pageFlip.updateFromHtml(document.querySelectorAll(".page")); // re-measure [web:1]
+                }
+            });
+
+            // ——— Encoder picker (Offscreen→Canvas, WebP→PNG) ———
+            async function pickBitmapEncoder() {
+                const hasOffscreen = typeof OffscreenCanvas !== 'undefined';
+                async function testOffscreen(type, quality) {
+                    try {
+                        const off = new OffscreenCanvas(2, 2);
+                        const ctx = off.getContext('2d', { alpha: false });
+                        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, 2, 2);
+                        const b = await off.convertToBlob({ type, quality });
+                        return !!(b && b.type === type);
+                    } catch { return false; }
+                } // Offscreen convertToBlob [web:13]
+                async function testCanvas(type, quality) {
+                    try {
+                        const c = document.createElement('canvas');
+                        c.width = c.height = 2;
+                        const ctx = c.getContext('2d', { alpha: false });
+                        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, 2, 2);
+                        const b = await new Promise(res => c.toBlob(res, type, quality));
+                        return !!(b && b.type === type);
+                    } catch { return false; }
+                } // HTMLCanvasElement.toBlob [web:13]
+                if (hasOffscreen && await testOffscreen('image/webp', 0.85)) return { useOffscreen: true, type: 'image/webp', quality: 0.85 }; // WebP [web:13]
+                if (hasOffscreen && await testOffscreen('image/png')) return { useOffscreen: true, type: 'image/png' }; // PNG [web:13]
+                if (await testCanvas('image/webp', 0.85)) return { useOffscreen: false, type: 'image/webp', quality: 0.85 }; // WebP [web:13]
+                return { useOffscreen: false, type: 'image/png' }; // PNG [web:13]
+            }
+
+        });
+    </script>
+</body>
+
+</html>
